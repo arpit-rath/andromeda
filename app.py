@@ -59,6 +59,13 @@ _WS_RE = re.compile(r"\s+")
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _format_number(value: float) -> str:
     if abs(value - int(value)) < 1e-9:
         return str(int(value))
@@ -398,11 +405,21 @@ def answer():
         return jsonify({"error": err}), 400
 
     parsed = parse_arithmetic_query(query)
-    if parsed is not None:
-        operation, left, right = parsed
-        raw_output = solve_arithmetic(operation, left, right)
-    else:
+    force_gemini_all = _env_flag("GEMINI_FORCE_ALL", True)
+
+    if force_gemini_all:
+        # Temporary mode: attempt Gemini-agent path for all prompts first.
         raw_output = llm_style_fallback(query, assets)
+        # Preserve exact arithmetic scoring behavior.
+        if parsed is not None:
+            operation, left, right = parsed
+            raw_output = solve_arithmetic(operation, left, right)
+    else:
+        if parsed is not None:
+            operation, left, right = parsed
+            raw_output = solve_arithmetic(operation, left, right)
+        else:
+            raw_output = llm_style_fallback(query, assets)
 
     final_output = sanitize_output(raw_output)
     return jsonify(build_output_payload(final_output)), 200
