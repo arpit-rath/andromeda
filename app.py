@@ -1097,65 +1097,85 @@ def try_list_operation(query: str) -> Optional[Tuple[str, bool]]:
     """
     q = query.strip()
     ql = q.lower()
-
+    
     # ── Helpers: extract numbers from query ──
     def _extract_numbers_from_query(text: str) -> list[float]:
-        # Look for numbers after a colon or keyword
-        m = re.search(r"[:\s]\s*([\d+\-.,\s]+)$", text)
+        # Try to extract bracketed lists first
+        m = re.search(r"\[([^\]]+)\]", text)
         if m:
             nums_str = m.group(1)
         else:
-            # Extract from brackets
-            m = re.search(r"\[([^\]]+)\]", text)
+            # Try to find numbers after punctuation (colon or question mark)
+            m = re.search(r"[:?]\s*([0-9+\-.,\s]+)", text)
             if m:
                 nums_str = m.group(1)
             else:
-                # Just find all numbers
+                # Fallback: take the entire text
                 nums_str = text
         nums = re.findall(r"[+-]?\d+(?:\.\d+)?", nums_str)
         return [float(n) for n in nums] if nums else []
 
-    # ── Sort numbers ──────────────────────────────────────────────────────
-    if re.search(r"sort\s+(?:the\s+)?(?:following\s+)?(?:numbers?|values?|list|array|elements?)", ql) or \
-       re.search(r"(?:arrange|order)\s+(?:the\s+)?(?:following\s+)?(?:numbers?|values?)", ql):
+    def _has_action(words: list[str]) -> bool:
+        for w in words:
+            if re.search(r"\b" + re.escape(w) + r"\b", ql):
+                return True
+        return False
+
+    # ── Sort numbers (ascending) ──────────────────────────────────────────
+    if _has_action(["sort", "arrange", "order"]) and re.search(r"numbers?|values?|list|array|elements?", ql):
         nums = _extract_numbers_from_query(q)
         if nums:
             nums.sort()
-            return ", ".join(_format_number(n) for n in nums), True
+            return ",".join(_format_number(n) for n in nums), True
 
     # ── Sort in descending order ──────────────────────────────────────────
-    if re.search(r"sort\s+.+\s+(?:in\s+)?(?:descending|reverse)\s*(?:order)?", ql):
+    if re.search(r"sort", ql) and re.search(r"descending|reverse", ql):
         nums = _extract_numbers_from_query(q)
         if nums:
             nums.sort(reverse=True)
-            return ", ".join(_format_number(n) for n in nums), True
+            return ",".join(_format_number(n) for n in nums), True
 
-    # ── Find maximum ──────────────────────────────────────────────────────
-    if re.search(r"(?:find\s+)?(?:the\s+)?(?:max(?:imum)?|largest|biggest|greatest)\s+(?:of|in|from|value|number)", ql):
+    # ── Find maximum / minimum ────────────────────────────────────────────
+    if _has_action(["max", "maximum", "largest", "biggest", "greatest"]) or re.search(r"largest|max(?:imum)?", ql):
         nums = _extract_numbers_from_query(q)
         if nums:
             return _format_number(max(nums)), True
 
-    # ── Find minimum ──────────────────────────────────────────────────────
-    if re.search(r"(?:find\s+)?(?:the\s+)?(?:min(?:imum)?|smallest|least)\s+(?:of|in|from|value|number)", ql):
+    if _has_action(["min", "minimum", "smallest", "least"]) or re.search(r"smallest|min(?:imum)?", ql):
         nums = _extract_numbers_from_query(q)
         if nums:
             return _format_number(min(nums)), True
 
-    # ── Sum of list ───────────────────────────────────────────────────────
-    if re.search(r"(?:find\s+)?(?:the\s+)?(?:sum|total)\s+(?:of|:)", ql):
+    # ── Product of numbers ───────────────────────────────────────────────
+    if _has_action(["product", "multiply"]) or re.search(r"product\s+of", ql):
         nums = _extract_numbers_from_query(q)
-        if nums and len(nums) > 2:
+        if nums:
+            prod = 1
+            for n in nums:
+                prod *= int(n) if float(n).is_integer() else n
+            return _format_number(prod), True
+
+    # ── Sum of even/odd/all numbers ──────────────────────────────────────
+    if _has_action(["sum", "total", "add", "add up", "compute", "calculate"]) or re.search(r"what\s+is\s+the\s+sum", ql):
+        nums = _extract_numbers_from_query(q)
+        if nums:
+            if re.search(r"\beven\b", ql):
+                even_nums = [n for n in nums if int(n) % 2 == 0]
+                return _format_number(sum(even_nums)) if even_nums else "0", True
+            if re.search(r"\bodd\b", ql):
+                odd_nums = [n for n in nums if int(n) % 2 != 0]
+                return _format_number(sum(odd_nums)) if odd_nums else "0", True
+            # Otherwise sum all
             return _format_number(sum(nums)), True
 
     # ── Average / mean ────────────────────────────────────────────────────
-    if re.search(r"(?:find\s+)?(?:the\s+)?(?:average|mean|avg)\s+(?:of|:)", ql):
+    if _has_action(["average", "mean", "avg"]) or re.search(r"what\s+is\s+the\s+average", ql):
         nums = _extract_numbers_from_query(q)
         if nums:
             return _format_number(sum(nums) / len(nums)), True
 
     # ── Median ────────────────────────────────────────────────────────────
-    if re.search(r"(?:find\s+)?(?:the\s+)?median\s+(?:of|:)", ql):
+    if _has_action(["median"]) or re.search(r"median", ql):
         nums = _extract_numbers_from_query(q)
         if nums:
             sorted_nums = sorted(nums)
@@ -1166,8 +1186,8 @@ def try_list_operation(query: str) -> Optional[Tuple[str, bool]]:
                 return _format_number((sorted_nums[n // 2 - 1] + sorted_nums[n // 2]) / 2), True
 
     # ── Count items ───────────────────────────────────────────────────────
-    if re.search(r"(?:count|how\s+many)\s+(?:items?|elements?|numbers?|values?)\s+(?:in|are\s+in)", ql):
-        # Try to find a list
+    if _has_action(["count"]) or re.search(r"how\s+many\b", ql):
+        # Try to find a bracketed list first
         m = re.search(r"\[([^\]]+)\]", q)
         if m:
             items = [x.strip() for x in m.group(1).split(",") if x.strip()]
@@ -1188,7 +1208,7 @@ def try_list_operation(query: str) -> Optional[Tuple[str, bool]]:
                 if item not in seen:
                     seen.add(item)
                     unique.append(item)
-            return ", ".join(unique), True
+            return ",".join(unique), True
         nums = _extract_numbers_from_query(q)
         if nums:
             seen = set()
@@ -1197,7 +1217,7 @@ def try_list_operation(query: str) -> Optional[Tuple[str, bool]]:
                 if n not in seen:
                     seen.add(n)
                     unique.append(n)
-            return ", ".join(_format_number(n) for n in unique), True
+            return ",".join(_format_number(n) for n in unique), True
 
     # ── Find common elements ──────────────────────────────────────────────
     if re.search(r"(?:find\s+)?(?:the\s+)?(?:common|shared|intersection)\s+(?:elements?|numbers?|values?)", ql):
@@ -1206,7 +1226,7 @@ def try_list_operation(query: str) -> Optional[Tuple[str, bool]]:
             set1 = set(x.strip() for x in brackets[0].split(","))
             set2 = set(x.strip() for x in brackets[1].split(","))
             common = sorted(set1 & set2)
-            return ", ".join(common), True
+            return ",".join(common), True
 
     # ── Reverse list ──────────────────────────────────────────────────────
     if re.search(r"reverse\s+(?:the\s+)?(?:list|array|order)", ql):
@@ -1783,8 +1803,72 @@ def sanitize_raw_output(text: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 12: MAIN ANSWER PIPELINE
+# SECTION 12: NUMBER PROPERTY QUESTIONS & MAIN ANSWER PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def try_number_property_question(query: str) -> Optional[Tuple[str, bool]]:
+    """Handle yes/no questions about number properties (odd/even, prime, etc.)"""
+    ql = query.lower().strip()
+    
+    # Extract number from query (with optional leading negative sign)
+    number_match = re.search(r'([+-]?\d+(?:\.\d+)?)', ql)
+    if not number_match:
+        return None
+    
+    try:
+        num_str = number_match.group(1)
+        if '.' in num_str:
+            num = float(num_str)
+        else:
+            num = int(num_str)
+    except (ValueError, AttributeError):
+        return None
+    
+    # Check for odd/even
+    if re.search(r'\b(?:is|are)\s+\d+(?:\.\d+)?\s+(?:an?\s+)?(?:odd|even)', ql):
+        if isinstance(num, float) and num != int(num):
+            return "Not applicable to decimals.", False
+        num_int = int(num)
+        if re.search(r'\b(?:odd|odd number)', ql):
+            return ("YES" if num_int % 2 != 0 else "NO"), False
+        elif re.search(r'\b(?:even|even number)', ql):
+            return ("YES" if num_int % 2 == 0 else "NO"), False
+    
+    # Check for prime
+    if re.search(r'\b(?:is|are)\s+\d+\s+(?:a\s+)?prime', ql):
+        if isinstance(num, float) and num != int(num):
+            return "Not applicable to decimals.", False
+        num_int = int(num)
+        if num_int < 2:
+            return "NO", False
+        is_prime = _is_prime(num_int)
+        return ("YES" if is_prime else "NO"), False
+    
+    # Check for positive/negative
+    if re.search(r'\b(?:is|are)\s+[+-]?\d+(?:\.\d+)?\s+(?:positive|negative|zero)', ql):
+        if re.search(r'\bpositive', ql):
+            return ("YES" if num > 0 else "NO"), False
+        elif re.search(r'\bnegative', ql):
+            return ("YES" if num < 0 else "NO"), False
+        elif re.search(r'\bzero', ql):
+            return ("YES" if num == 0 else "NO"), False
+    
+    # Check for divisibility
+    divisor_match = re.search(r'(?:divisible|divide)\s+by\s+(\d+)', ql)
+    if divisor_match:
+        try:
+            divisor = int(divisor_match.group(1))
+            if divisor == 0:
+                return "Cannot divide by zero.", False
+            if isinstance(num, float) and num != int(num):
+                return "Not applicable to decimals.", False
+            num_int = int(num)
+            return ("YES" if num_int % divisor == 0 else "NO"), False
+        except (ValueError, ZeroDivisionError):
+            return None
+    
+    return None
+
 
 def _is_extraction_query(query: str) -> bool:
     """Detect if a query is an extraction/processing type (raw output mode)."""
@@ -1850,6 +1934,11 @@ def generate_answer(query: str, assets: list) -> Tuple[str, bool]:
 
     # ── Step 5: Date operations ──
     result = try_date_operation(query)
+    if result is not None:
+        return result
+
+    # ── Step 5.5: Number property questions ──
+    result = try_number_property_question(query)
     if result is not None:
         return result
 
