@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import re
 import json
+import os
+from urllib import error as urlerror
+from urllib import request as urlrequest
 from typing import Optional, Tuple
 
 from flask import Flask, jsonify, request
@@ -113,29 +116,76 @@ def solve_arithmetic(operation: str, left: float, right: float) -> str:
 
 
 def llm_style_fallback(query: str, assets: list) -> str:
-    # Minimal, deterministic fallback for non-arithmetic queries.
-    _ = query
-    _ = assets
-    return "I cannot determine the answer."
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return "I cannot determine the answer."
+
+    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={api_key}"
+    )
+
+    assets_text = "\n".join(str(item) for item in assets[:10]) if assets else ""
+    prompt = (
+        "Answer the query in exactly one concise sentence ending with a period. "
+        "Do not add prefixes, labels, or multiple sentences. "
+        f"Query: {query}\n"
+        f"Assets: {assets_text if assets_text else 'None'}"
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "topP": 0.1,
+            "maxOutputTokens": 80,
+        },
+    }
+
+    try:
+        req = urlrequest.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlrequest.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urlerror.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        return "I cannot determine the answer."
+
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        return "I cannot determine the answer."
 
 
 def sanitize_output(text: str) -> str:
     if not isinstance(text, str):
         return "I cannot determine the answer."
 
-    text = text.strip()
+    cleaned = " ".join(text.replace("\n", " ").split()).strip()
+    if not cleaned:
+        return "I cannot determine the answer."
 
-    # Force exact patterns
-    if text.startswith("The sum is"):
-        return text.split('.')[0] + '.'
-    if text.startswith("The difference is"):
-        return text.split('.')[0] + '.'
-    if text.startswith("The product is"):
-        return text.split('.')[0] + '.'
-    if text.startswith("The quotient is"):
-        return text.split('.')[0] + '.'
+    # Preserve exact arithmetic phrasing and decimals while forcing final period.
+    arith_match = re.match(
+        r"^(The (sum|difference|product|quotient) is [+-]?(?:\d+(?:\.\d+)?|\.\d+|undefined))",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if arith_match:
+        sentence = arith_match.group(1)
+        sentence = sentence[0].upper() + sentence[1:]
+        return sentence.rstrip(".!? ") + "."
 
-    return "I cannot determine the answer."
+    # General single-sentence normalization for Gemini fallback.
+    split_match = re.search(r"[!?]|\.(?!\d)", cleaned)
+    if split_match:
+        cleaned = cleaned[: split_match.start() + 1]
+
+    return cleaned.rstrip(".!? ") + "."
 
 
 def validate_payload(payload: object) -> Tuple[bool, Optional[str], Optional[str], Optional[list]]:
