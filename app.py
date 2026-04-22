@@ -36,6 +36,7 @@ app = Flask(__name__)
 _GEMINI_TIMEOUT = 15.0
 _GEMINI_MAX_RETRIES = 5
 _GEMINI_BACKOFF_BASE = 2.0
+_GEMINI_MAX_TOTAL_WAIT = 6.0  # max cumulative seconds to wait for LLM per-request
 _WEB_TIMEOUT = 3.0
 _MAX_ASSET_BYTES = 32000
 _MAX_CONTEXT_CHARS = 16000
@@ -1644,6 +1645,11 @@ A: bonono
 
 
 def _call_gemini(query: str, context: str) -> Optional[str]:
+    # Allow disabling Gemini entirely via env to force local-only behavior
+    if _env_flag("GEMINI_DISABLED", False):
+        print("[EVAL-LOG] Gemini disabled via GEMINI_DISABLED", flush=True)
+        return None
+
     api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
     if not api_key:
         print("[EVAL-LOG] No Gemini API key found!", flush=True)
@@ -1672,7 +1678,9 @@ def _call_gemini(query: str, context: str) -> Optional[str]:
         },
     }
 
+    # Try models in order but avoid long blocking sleeps per-request.
     for model in model_candidates:
+        total_waited = 0.0
         for attempt in range(_GEMINI_MAX_RETRIES):
             endpoint = (
                 "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -1698,8 +1706,8 @@ def _call_gemini(query: str, context: str) -> Optional[str]:
             except urlerror.HTTPError as e:
                 status = getattr(e, "code", 0)
                 print(f"[EVAL-LOG] Gemini HTTP {status} on {model} (attempt {attempt+1}): {repr(e)}", flush=True)
+                # Short-circuit on 429s that would force long waits: try next model instead
                 if status == 429:
-                    # Try to respect Retry-After header when present (seconds or HTTP-date)
                     retry_after = None
                     try:
                         if hasattr(e, "headers") and e.headers:
@@ -1727,24 +1735,45 @@ def _call_gemini(query: str, context: str) -> Optional[str]:
                             except Exception:
                                 parsed_seconds = None
 
-                    if parsed_seconds is not None and parsed_seconds > 0:
-                        wait = min(parsed_seconds, 60.0)
-                    else:
-                        wait = _GEMINI_BACKOFF_BASE * (2 ** attempt)
+                    # If the server suggests waiting longer than our per-request budget, skip this model.
+                    if parsed_seconds is not None and parsed_seconds > _GEMINI_MAX_TOTAL_WAIT:
+                        print(f"[EVAL-LOG] Retry-After {parsed_seconds}s exceeds budget; skipping model {model}", flush=True)
+                        break
 
-                    # Add small jitter to avoid synchronized retries
-                    jitter = random.uniform(0, min(1.0, wait * 0.1))
-                    wait = min(wait + jitter, 60.0)
-                    print(f"[EVAL-LOG] Respecting Retry-After: sleeping {wait:.2f}s (parsed={parsed_seconds})", flush=True)
-                    time.sleep(wait)
+                    # Choose a short wait (bounded by remaining budget)
+                    if parsed_seconds is not None and parsed_seconds > 0:
+                        wait = min(parsed_seconds, _GEMINI_MAX_TOTAL_WAIT - total_waited)
+                    else:
+                        wait = min(_GEMINI_BACKOFF_BASE * (2 ** attempt), _GEMINI_MAX_TOTAL_WAIT - total_waited, 2.0)
+
+                    if wait <= 0:
+                        print(f"[EVAL-LOG] No remaining Gemini wait budget; skipping model {model}", flush=True)
+                        break
+
+                    jitter = random.uniform(0, min(0.5, wait * 0.1))
+                    sleep_time = min(wait + jitter, _GEMINI_MAX_TOTAL_WAIT - total_waited)
+                    print(f"[EVAL-LOG] Respecting Retry-After/Backoff: sleeping {sleep_time:.2f}s (parsed={parsed_seconds})", flush=True)
+                    time.sleep(sleep_time)
+                    total_waited += sleep_time
+                    if total_waited >= _GEMINI_MAX_TOTAL_WAIT:
+                        print(f"[EVAL-LOG] Reached Gemini wait budget for model {model}; moving on", flush=True)
+                        break
                     continue
                 elif status in (500, 502, 503):
-                    time.sleep(1.0)
+                    small = min(0.5, _GEMINI_MAX_TOTAL_WAIT - total_waited)
+                    if small <= 0:
+                        break
+                    time.sleep(small)
+                    total_waited += small
                     continue
                 break
             except (urlerror.URLError, TimeoutError) as e:
                 print(f"[EVAL-LOG] Gemini network error on {model} (attempt {attempt+1}): {repr(e)}", flush=True)
-                time.sleep(1.0)
+                small = min(0.5, _GEMINI_MAX_TOTAL_WAIT - total_waited)
+                if small <= 0:
+                    break
+                time.sleep(small)
+                total_waited += small
                 continue
             except Exception as e:
                 print(f"[EVAL-LOG] Gemini error on {model} (attempt {attempt+1}): {repr(e)}", flush=True)
@@ -1962,16 +1991,29 @@ def try_comparative_scores(query: str) -> Optional[Tuple[str, bool]]:
     if re.search(r"who\b.*(?:scored|has|got).*\b(highest|highest score|most|best|top)\b", ql) or re.search(r"who\s+scored\s+highest", ql):
         max_score = max(pairs, key=lambda x: x[1])[1]
         winners = [name for name, score in pairs if score == max_score]
+        # If tie and user asked for the first-mentioned winner, return only the first occurrence
+        if len(winners) > 1 and re.search(r"\bfirst\b|first\s+mentioned|first\s+one", ql):
+            for name, score in pairs:
+                if score == max_score:
+                    return name, True
         return _format_names(winners), True
     if re.search(r"who\b.*(?:scored|has|got).*\b(lowest|least|worst|bottom)\b", ql) or re.search(r"who\s+scored\s+lowest", ql):
         min_score = min(pairs, key=lambda x: x[1])[1]
         losers = [name for name, score in pairs if score == min_score]
+        if len(losers) > 1 and re.search(r"\bfirst\b|first\s+mentioned|first\s+one", ql):
+            for name, score in pairs:
+                if score == min_score:
+                    return name, True
         return _format_names(losers), True
 
-    # Also support direct comparative phrasing like "Who scored highest?" when there are scores
-    if re.search(r"who\b.*(highest|lowest|most|least|top|bottom)", ql):
+    # Also support direct comparative phrasing like "Who scored highest?" or imperative forms
+    if re.search(r"who\b.*(highest|lowest|most|least|top|bottom)", ql) or re.search(r"\b(return|give|show|list|which)\b.*(highest|lowest|top|bottom|most|least)", ql):
         max_score = max(pairs, key=lambda x: x[1])[1]
         winners = [name for name, score in pairs if score == max_score]
+        if len(winners) > 1 and re.search(r"\bfirst\b|first\s+mentioned|first\s+one", ql):
+            for name, score in pairs:
+                if score == max_score:
+                    return name, True
         return _format_names(winners), True
 
     return None
