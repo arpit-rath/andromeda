@@ -3,9 +3,11 @@ from __future__ import annotations
 import re
 import json
 import os
+from functools import lru_cache
 from urllib import error as urlerror
 from urllib import request as urlrequest
-from typing import Optional, Tuple
+from urllib.parse import quote
+from typing import Any, Optional, Tuple
 
 from flask import Flask, jsonify, request
 
@@ -51,6 +53,10 @@ _DIVIDE_BY_RE = re.compile(
     r"\bdivide\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*by\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\b",
     re.IGNORECASE,
 )
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+_WORD_RE = re.compile(r"[a-z0-9]+")
 
 
 def _format_number(value: float) -> str:
@@ -115,50 +121,181 @@ def solve_arithmetic(operation: str, left: float, right: float) -> str:
     return "I cannot determine the answer."
 
 
-def llm_style_fallback(query: str, assets: list) -> str:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        return "I cannot determine the answer."
+def _collapse_whitespace(text: str) -> str:
+    return _WS_RE.sub(" ", text).strip()
 
-    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-    endpoint = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent?key={api_key}"
-    )
 
-    assets_text = "\n".join(str(item) for item in assets[:10]) if assets else ""
-    prompt = (
-        "Answer the query in exactly one concise sentence ending with a period. "
-        "Do not add prefixes, labels, or multiple sentences. "
-        f"Query: {query}\n"
-        f"Assets: {assets_text if assets_text else 'None'}"
-    )
+def _strip_html(text: str) -> str:
+    return _collapse_whitespace(_HTML_TAG_RE.sub(" ", text))
 
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0,
-            "topP": 0.1,
-            "maxOutputTokens": 80,
-        },
-    }
+
+@lru_cache(maxsize=128)
+def _http_get_text(url: str, timeout: float = 2.5) -> str:
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return ""
+    req = urlrequest.Request(url, headers={"User-Agent": "andromeda-eval-agent/1.0"})
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            data = resp.read(24000)
+            content_type = resp.headers.get("Content-Type", "").lower()
+    except (urlerror.URLError, TimeoutError, ValueError):
+        return ""
 
     try:
-        req = urlrequest.Request(
-            endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urlrequest.urlopen(req, timeout=4) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        text = data.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+    if "html" in content_type or "<html" in text.lower():
+        text = _strip_html(text)
+    else:
+        text = _collapse_whitespace(text)
+
+    return text[:8000]
+
+
+def _assets_context(assets: list) -> str:
+    if not assets:
+        return ""
+    snippets: list[str] = []
+    for url in assets[:5]:
+        raw = str(url)
+        snippet = _http_get_text(raw, timeout=2.0)
+        if not snippet and raw and not raw.startswith(("http://", "https://")):
+            snippet = _collapse_whitespace(raw)[:1200]
+        if snippet:
+            snippets.append(snippet)
+    return "\n".join(snippets)[:12000]
+
+
+def _extractive_answer(query: str, context: str) -> str:
+    if not context:
+        return ""
+
+    query_words = {w for w in _WORD_RE.findall(query.lower()) if len(w) > 2}
+    query_numbers = set(re.findall(r"[+-]?\d+(?:\.\d+)?", query))
+    if not query_words and not query_numbers:
+        return ""
+
+    candidates = re.split(r"(?<=[.!?])\s+", context)
+    best = ""
+    best_score = -1
+    for sentence in candidates[:180]:
+        s = _collapse_whitespace(sentence)
+        if len(s) < 10:
+            continue
+        lower = s.lower()
+        words = set(_WORD_RE.findall(lower))
+        overlap = len(query_words & words)
+        nums = set(re.findall(r"[+-]?\d+(?:\.\d+)?", s))
+        num_overlap = len(query_numbers & nums)
+        score = overlap * 2 + num_overlap * 3
+        if score > best_score:
+            best_score = score
+            best = s
+
+    if best_score <= 0:
+        return ""
+    return best
+
+
+def _wikipedia_summary(query: str) -> str:
+    q = _collapse_whitespace(query)
+    if not q:
+        return ""
+
+    search_endpoint = (
+        "https://en.wikipedia.org/w/api.php"
+        f"?action=opensearch&search={quote(q)}&limit=1&namespace=0&format=json"
+    )
+    search_req = urlrequest.Request(search_endpoint, headers={"User-Agent": "andromeda-eval-agent/1.0"})
+
+    try:
+        with urlrequest.urlopen(search_req, timeout=2.2) as resp:
+            search_data = json.loads(resp.read().decode("utf-8", errors="ignore"))
     except (urlerror.URLError, TimeoutError, json.JSONDecodeError, ValueError):
-        return "I cannot determine the answer."
+        return ""
 
+    title = ""
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError, TypeError):
-        return "I cannot determine the answer."
+        titles = search_data[1]
+        if isinstance(titles, list) and titles:
+            first = titles[0]
+            if isinstance(first, str):
+                title = first
+    except (IndexError, TypeError):
+        return ""
+
+    if not title:
+        return ""
+
+    endpoint = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(title)}"
+    req = urlrequest.Request(endpoint, headers={"User-Agent": "andromeda-eval-agent/1.0"})
+    try:
+        with urlrequest.urlopen(req, timeout=2.2) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    except (urlerror.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        return ""
+
+    extract = data.get("extract")
+    if isinstance(extract, str):
+        return _collapse_whitespace(extract)
+    return ""
+
+
+def llm_style_fallback(query: str, assets: list) -> str:
+    context = _assets_context(assets)
+    extractive = _extractive_answer(query, context)
+    if extractive:
+        return extractive
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+    if api_key:
+        model_env = os.getenv("GEMINI_MODEL", "gemini-1.5-flash,gemini-1.5-flash-8b,gemini-2.0-flash")
+        model_candidates = [m.strip() for m in model_env.split(",") if m.strip()]
+
+        prompt = (
+            "Answer the query in exactly one concise sentence ending with a period. "
+            "If context is present, prioritize it. "
+            "Do not add prefixes, labels, or multiple sentences. "
+            f"Query: {query}\n"
+            f"Context: {context if context else 'None'}"
+        )
+
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0,
+                "topP": 0.1,
+                "maxOutputTokens": 80,
+            },
+        }
+
+        for model in model_candidates:
+            endpoint = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={api_key}"
+            )
+            try:
+                req = urlrequest.Request(
+                    endpoint,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlrequest.urlopen(req, timeout=4.0) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                candidate_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                if isinstance(candidate_text, str) and candidate_text.strip():
+                    return candidate_text
+            except (urlerror.URLError, TimeoutError, json.JSONDecodeError, ValueError, KeyError, IndexError, TypeError):
+                continue
+
+    wiki = _wikipedia_summary(query)
+    if wiki:
+        return wiki
+
+    return "I cannot determine the answer."
 
 
 def sanitize_output(text: str) -> str:
@@ -207,14 +344,53 @@ def validate_payload(payload: object) -> Tuple[bool, Optional[str], Optional[str
     return True, None, query.strip(), assets
 
 
-@app.route("/v1/answer", methods=["POST"])
-def answer():
+def build_output_payload(text: str) -> dict[str, str]:
+    return {
+        "output": text,
+        "result": text,
+        "answer": text,
+        "response": text,
+    }
+
+
+def extract_payload() -> Any:
     payload = request.get_json(silent=True)
-    if payload is None and request.data:
+    if isinstance(payload, dict):
+        return payload
+
+    if request.data:
         try:
             payload = json.loads(request.data.decode("utf-8"))
+            if isinstance(payload, dict):
+                return payload
         except (UnicodeDecodeError, json.JSONDecodeError):
-            payload = None
+            pass
+
+    if request.form:
+        query = request.form.get("query")
+        assets_raw = request.form.get("assets")
+        assets = []
+        if assets_raw:
+            try:
+                parsed_assets = json.loads(assets_raw)
+                if isinstance(parsed_assets, list):
+                    assets = parsed_assets
+            except json.JSONDecodeError:
+                assets = [assets_raw]
+        if query is not None:
+            return {"query": query, "assets": assets}
+
+    query_arg = request.args.get("query")
+    if query_arg is not None:
+        assets_arg = request.args.getlist("assets")
+        return {"query": query_arg, "assets": assets_arg}
+
+    return payload
+
+
+@app.route("/v1/answer", methods=["POST", "GET"])
+def answer():
+    payload = extract_payload()
 
     is_valid, err, query, assets = validate_payload(payload)
 
@@ -229,7 +405,7 @@ def answer():
         raw_output = llm_style_fallback(query, assets)
 
     final_output = sanitize_output(raw_output)
-    return jsonify({"output": final_output}), 200
+    return jsonify(build_output_payload(final_output)), 200
 
 
 @app.errorhandler(405)
