@@ -1870,6 +1870,53 @@ def try_number_property_question(query: str) -> Optional[Tuple[str, bool]]:
     return None
 
 
+def try_comparative_scores(query: str) -> Optional[Tuple[str, bool]]:
+    """Handle comparative score questions like
+    'Alice scored 80, Bob scored 90. Who scored highest?'
+    Returns (name, is_raw) or None.
+    """
+    ql = query.lower()
+
+    # Look for patterns like "Name scored 90" (capture original casing)
+    # Allow dots (titles), digits and common punctuation in names (e.g., "Prof. Jane Doe", "Dr. A.B.")
+    miter = re.finditer(r"([A-Za-z][A-Za-z0-9\.\'\- ]{0,80}?)\s+scored\s+([+-]?\d+(?:\.\d+)?%?)", query)
+    pairs: list[tuple[str, float]] = []
+    for m in miter:
+        name = m.group(1).strip()
+        score_raw = m.group(2).strip().rstrip("%")
+        try:
+            score = float(score_raw)
+        except ValueError:
+            continue
+        pairs.append((name, score))
+
+    if len(pairs) < 2:
+        return None
+
+    # Helper to format possibly multiple names (ties)
+    def _format_names(names: list[str]) -> str:
+        # Preserve original spacing/comma-separated list without trailing space
+        return ", ".join(names)
+
+    # Determine intent: highest / lowest
+    if re.search(r"who\b.*(?:scored|has|got).*\b(highest|highest score|most|best|top)\b", ql) or re.search(r"who\s+scored\s+highest", ql):
+        max_score = max(pairs, key=lambda x: x[1])[1]
+        winners = [name for name, score in pairs if score == max_score]
+        return _format_names(winners), True
+    if re.search(r"who\b.*(?:scored|has|got).*\b(lowest|least|worst|bottom)\b", ql) or re.search(r"who\s+scored\s+lowest", ql):
+        min_score = min(pairs, key=lambda x: x[1])[1]
+        losers = [name for name, score in pairs if score == min_score]
+        return _format_names(losers), True
+
+    # Also support direct comparative phrasing like "Who scored highest?" when there are scores
+    if re.search(r"who\b.*(highest|lowest|most|least|top|bottom)", ql):
+        max_score = max(pairs, key=lambda x: x[1])[1]
+        winners = [name for name, score in pairs if score == max_score]
+        return _format_names(winners), True
+
+    return None
+
+
 def _is_extraction_query(query: str) -> bool:
     """Detect if a query is an extraction/processing type (raw output mode)."""
     ql = query.lower().strip()
@@ -1939,6 +1986,11 @@ def generate_answer(query: str, assets: list) -> Tuple[str, bool]:
 
     # ── Step 5.5: Number property questions ──
     result = try_number_property_question(query)
+    if result is not None:
+        return result
+
+    # ── Step 5.6: Comparative score questions (who scored highest/lowest) ──
+    result = try_comparative_scores(query)
     if result is not None:
         return result
 
