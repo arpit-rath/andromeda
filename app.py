@@ -15,6 +15,8 @@ import os
 import hashlib
 import datetime
 import calendar
+import random
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 import time
 from urllib import error as urlerror
@@ -887,11 +889,18 @@ def try_string_operation(query: str) -> Optional[Tuple[str, bool]]:
     # ── Reverse string ────────────────────────────────────────────────────
     m = re.match(r"reverse\s+(?:the\s+)?(?:string\s+)?[:\s]*(.+)$", q, re.IGNORECASE)
     if m:
-        text = m.group(1).strip().rstrip(".")
-        # Remove surrounding quotes
-        if len(text) >= 2 and text[0] in ('"', "'") and text[-1] in ('"', "'"):
-            text = text[1:-1]
-        return text[::-1], True
+        # Only treat as string-reverse when explicit 'string' keyword or a quoted string is provided.
+        prefix_is_string = re.match(r"reverse\s+(?:the\s+)?string", q, re.IGNORECASE) is not None
+        candidate = m.group(1).strip().rstrip(".")
+        if not prefix_is_string and not (len(candidate) >= 2 and candidate[0] in ('\"', "'") and candidate[-1] in ('\"', "'")):
+            # It's likely a different reverse operation (e.g., reverse list) — fall through
+            pass
+        else:
+            text = candidate
+            # Remove surrounding quotes
+            if len(text) >= 2 and text[0] in ('\"', "'") and text[-1] in ('\"', "'"):
+                text = text[1:-1]
+            return text[::-1], True
 
     # ── Uppercase ─────────────────────────────────────────────────────────
     if re.match(r"(?:convert\s+)?(?:to\s+)?(?:upper\s*case|uppercase)", ql):
@@ -1233,11 +1242,11 @@ def try_list_operation(query: str) -> Optional[Tuple[str, bool]]:
         m = re.search(r"\[([^\]]+)\]", q)
         if m:
             items = [x.strip() for x in m.group(1).split(",") if x.strip()]
-            return ", ".join(reversed(items)), True
+            return ",".join(reversed(items)), True
         nums = _extract_numbers_from_query(q)
         if nums:
             nums.reverse()
-            return ", ".join(_format_number(n) for n in nums), True
+            return ",".join(_format_number(n) for n in nums), True
 
     return None
 
@@ -1690,8 +1699,44 @@ def _call_gemini(query: str, context: str) -> Optional[str]:
                 status = getattr(e, "code", 0)
                 print(f"[EVAL-LOG] Gemini HTTP {status} on {model} (attempt {attempt+1}): {repr(e)}", flush=True)
                 if status == 429:
-                    wait = _GEMINI_BACKOFF_BASE * (2 ** attempt)
-                    time.sleep(min(wait, 10.0))
+                    # Try to respect Retry-After header when present (seconds or HTTP-date)
+                    retry_after = None
+                    try:
+                        if hasattr(e, "headers") and e.headers:
+                            retry_after = e.headers.get("Retry-After") or e.headers.get("retry-after")
+                        else:
+                            info = getattr(e, "info", None)
+                            if callable(info):
+                                hdrs = e.info()
+                                if hdrs:
+                                    retry_after = hdrs.get("Retry-After") or hdrs.get("retry-after")
+                    except Exception:
+                        retry_after = None
+
+                    parsed_seconds = None
+                    if retry_after:
+                        retry_after = str(retry_after).strip()
+                        try:
+                            parsed_seconds = int(retry_after)
+                        except Exception:
+                            try:
+                                dt = parsedate_to_datetime(retry_after)
+                                if dt.tzinfo is None:
+                                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                                parsed_seconds = (dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                            except Exception:
+                                parsed_seconds = None
+
+                    if parsed_seconds is not None and parsed_seconds > 0:
+                        wait = min(parsed_seconds, 60.0)
+                    else:
+                        wait = _GEMINI_BACKOFF_BASE * (2 ** attempt)
+
+                    # Add small jitter to avoid synchronized retries
+                    jitter = random.uniform(0, min(1.0, wait * 0.1))
+                    wait = min(wait + jitter, 60.0)
+                    print(f"[EVAL-LOG] Respecting Retry-After: sleeping {wait:.2f}s (parsed={parsed_seconds})", flush=True)
+                    time.sleep(wait)
                     continue
                 elif status in (500, 502, 503):
                     time.sleep(1.0)
@@ -1824,8 +1869,23 @@ def try_number_property_question(query: str) -> Optional[Tuple[str, bool]]:
     except (ValueError, AttributeError):
         return None
     
-    # Check for odd/even
-    if re.search(r'\b(?:is|are)\s+\d+(?:\.\d+)?\s+(?:an?\s+)?(?:odd|even)', ql):
+    # Check for list-wide even/odd like "Are 2,4,6 even?" or bracketed lists
+    list_check = re.search(r"\b(?:is|are)\s+([0-9+\-.,\s\[\]]+)\s+(?:all\s+)?(even|odd)\b", ql)
+    if list_check:
+        nums_raw = list_check.group(1)
+        nums = re.findall(r"[+-]?\d+(?:\.\d+)?", nums_raw)
+        if nums:
+            nums_f = [int(n) if '.' not in n and float(n).is_integer() else float(n) for n in nums]
+            typ = list_check.group(2)
+            if typ == 'even':
+                all_even = all(int(n) % 2 == 0 for n in nums_f)
+                return ("YES" if all_even else "NO"), False
+            else:
+                all_odd = all(int(n) % 2 != 0 for n in nums_f)
+                return ("YES" if all_odd else "NO"), False
+
+    # Check for odd/even (single number) — accept signed numbers
+    if re.search(r"\b(?:is|are)\s+[+-]?\d+(?:\.\d+)?\s+(?:an?\s+)?(?:odd|even)", ql):
         if isinstance(num, float) and num != int(num):
             return "Not applicable to decimals.", False
         num_int = int(num)
